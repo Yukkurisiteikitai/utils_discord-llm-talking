@@ -4,3 +4,9 @@ __pycache__/
 *.pyc
 .DS_Store
 *.wav
+
+# 別プロジェクト(AronaNative, Windows/CUDA)。独自の .git を持つため本リポジトリでは管理しない。
+toy-a/
+
+# 実行時に生成されるターン計測ログ。
+logs/

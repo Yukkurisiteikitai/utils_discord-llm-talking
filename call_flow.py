@@ -11,8 +11,9 @@ from discord.ext import voice_recv
 
 import config
 from audio.player import QueuedPCMSource
-from audio.sink import UtteranceSink
+from audio.sink import UtteranceSink, VadResult
 from pipeline.llm import LanguageModel
+from pipeline.metrics import TurnLogger, TurnRecord
 from pipeline.stt import SpeechToText
 from pipeline.tts import TextToSpeech, TextToSpeechError
 
@@ -64,6 +65,9 @@ class CallManager:
         self.stt: SpeechToText | None = None
         self.llm: LanguageModel | None = None
         self.tts = TextToSpeech()
+
+        self.metrics = TurnLogger(config.METRICS_LOG_PATH) if config.METRICS_ENABLED else None
+        self._turn_index = 0
 
     async def load_models(self) -> None:
         self.loop = asyncio.get_running_loop()
@@ -200,16 +204,42 @@ class CallManager:
     # ------------------------------------------------------------------
     # 会話パイプライン (STT -> LLM(文単位ストリーミング) -> TTS -> 再生)
     # ------------------------------------------------------------------
-    async def handle_utterance(self, pcm_16k: np.ndarray) -> None:
+    async def handle_utterance(self, vad: VadResult) -> None:
         if self.state is not CallState.IN_CALL or self.stt is None or self.llm is None:
             return
-        t0 = time.monotonic()
+        # すべてのレイテンシは「話し終わった瞬間」(speech_end)を起点に測る。
+        speech_end = vad.speech_end_mono
 
-        text = await asyncio.to_thread(self.stt.transcribe, pcm_16k)
-        if not text:
-            return
+        record: TurnRecord | None = None
+        if self.metrics is not None:
+            self._turn_index += 1
+            record = TurnRecord(
+                turn_index=self._turn_index,
+                utterance_ms=vad.utterance_ms,
+                pre_roll_ms=vad.pre_roll_ms,
+                ended_at_max=vad.ended_at_max,
+            )
+            # 発話終了→最初のAI発声のギャップは、実際の再生スレッドから受け取る。
+            if self.player is not None:
+                self.player.begin_turn(
+                    speech_end,
+                    lambda gap_ms, r=record: setattr(r, "response_gap_ms", gap_ms),
+                )
+
+        text = await asyncio.to_thread(self.stt.transcribe, vad.pcm)
+        if record is not None:
+            record.stt_ms = (time.monotonic() - speech_end) * 1000
+            record.stt_text = text
         if config.LOG_LATENCY:
-            print(f"[latency] STT: {time.monotonic() - t0:.2f}s -> {text!r}")
+            print(f"[latency] STT: {time.monotonic() - speech_end:.2f}s -> {text!r}")
+        if not text:
+            # 無音/幻聴で応答しないターンも、データとして残す(再生は起きないので
+            # begin_turn のマーカーを解除してから記録する)。
+            if record is not None:
+                if self.player is not None:
+                    self.player.begin_turn(speech_end, lambda _gap: None)
+                self.metrics.write(record)
+            return
 
         self.history.append({"role": "user", "content": text})
         self.history = self.history[-config.HISTORY_TURNS * 2 :]
@@ -221,17 +251,34 @@ class CallManager:
             nonlocal first_logged
             for sentence in self.llm.stream_sentences(self.history):
                 assistant_parts.append(sentence)
-                if config.LOG_LATENCY and not first_logged:
+                if not first_logged:
                     first_logged = True
-                    elapsed = time.monotonic() - t0
-                    print(f"[latency] LLM first sentence: {elapsed:.2f}s -> {sentence!r}")
-                asyncio.run_coroutine_threadsafe(self._speak(sentence, t0), self.loop)
+                    elapsed = time.monotonic() - speech_end
+                    if record is not None:
+                        record.llm_first_sentence_ms = elapsed * 1000
+                    if config.LOG_LATENCY:
+                        print(f"[latency] LLM first sentence: {elapsed:.2f}s -> {sentence!r}")
+                asyncio.run_coroutine_threadsafe(
+                    self._speak(sentence, speech_end, record), self.loop
+                )
 
         await asyncio.to_thread(_run_llm)
         if assistant_parts:
             self.history.append({"role": "assistant", "content": "".join(assistant_parts)})
 
-    async def _speak(self, sentence: str, t0: float) -> None:
+        if record is not None:
+            # 体感の肝である response_gap_ms は再生スレッドから遅れて届くため、
+            # 鳴り始める(最大2s)まで待ってから記録する。
+            for _ in range(200):
+                if record.response_gap_ms is not None or self.player is None:
+                    break
+                await asyncio.sleep(0.01)
+            record.n_sentences = len(assistant_parts)
+            self.metrics.write(record)
+
+    async def _speak(
+        self, sentence: str, speech_end: float, record: TurnRecord | None = None
+    ) -> None:
         if self.player is None:
             return
         try:
@@ -239,6 +286,8 @@ class CallManager:
         except TextToSpeechError as exc:
             print(f"[tts] error: {exc}")
             return
+        if record is not None and record.tts_first_chunk_ms is None:
+            record.tts_first_chunk_ms = (time.monotonic() - speech_end) * 1000
         self.player.push_wav(wav_bytes)
         if config.LOG_LATENCY:
-            print(f"[latency] TTS chunk ready: {time.monotonic() - t0:.2f}s -> {sentence!r}")
+            print(f"[latency] TTS chunk ready: {time.monotonic() - speech_end:.2f}s -> {sentence!r}")

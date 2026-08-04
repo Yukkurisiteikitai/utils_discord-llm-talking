@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import io
 import queue
+import time
 import wave
+from typing import Callable, Optional
 
 import discord
 import numpy as np
@@ -56,6 +58,18 @@ class QueuedPCMSource(discord.AudioSource):
         self._queue: "queue.Queue[bytes]" = queue.Queue()
         self._current = b""
         self._offset = 0
+        # このターンの応答が最初に鳴った瞬間を測るためのマーカー。
+        # begin_turn() で発話終了時刻をセットし、最初の実フレーム再生時に
+        # 経過(ms)をコールバックへ渡して1回だけ発火する(体感レイテンシ=間の指標)。
+        self._turn_start_mono: Optional[float] = None
+        self._on_playback_start: Optional[Callable[[float], None]] = None
+
+    def begin_turn(
+        self, speech_end_mono: float, on_start: Callable[[float], None]
+    ) -> None:
+        """このターンの応答再生が最初に鳴った瞬間に、発話終了からの経過(ms)を通知する。"""
+        self._turn_start_mono = speech_end_mono
+        self._on_playback_start = on_start
 
     def push_wav(self, wav_bytes: bytes) -> None:
         self._queue.put(_wav_to_discord_pcm(wav_bytes))
@@ -68,6 +82,7 @@ class QueuedPCMSource(discord.AudioSource):
             try:
                 self._current = self._queue.get_nowait()
                 self._offset = 0
+                self._report_playback_start()
             except queue.Empty:
                 return _SILENCE_FRAME
 
@@ -76,6 +91,17 @@ class QueuedPCMSource(discord.AudioSource):
         if len(chunk) < _FRAME_BYTES:
             chunk += b"\x00" * (_FRAME_BYTES - len(chunk))
         return chunk
+
+    def _report_playback_start(self) -> None:
+        """このターンで初めて実データを再生に載せた瞬間に1回だけ発火する。"""
+        if self._turn_start_mono is None:
+            return
+        gap_ms = (time.monotonic() - self._turn_start_mono) * 1000
+        callback = self._on_playback_start
+        self._turn_start_mono = None
+        self._on_playback_start = None
+        if callback is not None:
+            callback(gap_ms)
 
     def is_opus(self) -> bool:
         return False

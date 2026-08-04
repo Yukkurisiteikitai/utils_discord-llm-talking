@@ -110,10 +110,59 @@ INFOログが高頻度で出続け、それ自体がCPUを消費して応答レ�
 bot.py           - エントリポイント。libopus/DAVE等の起動時パッチもここに集約
 call_flow.py      - 着信〜通話状態管理、STT→LLM→TTSパイプラインの結線
 config.py         - 全設定値(モデル選択、TTS設定、VADしきい値、着信スケジュール等)
-audio/sink.py     - リアルタイム音声受信 + Silero VAD
-audio/player.py   - TTS音声のキュー再生
+audio/sink.py     - リアルタイム音声受信 + Silero VAD + pre-roll(語頭欠落防止)
+audio/player.py   - TTS音声のキュー再生 + 発話終了→初回発声ギャップ計測
 pipeline/stt.py   - MLX Whisperラッパー
 pipeline/llm.py   - mlx-lmラッパー(文単位ストリーミング + 繰り返し検知)
 pipeline/tts.py   - VOICEVOX互換TTSクライアント(自動起動ロジック含む)
+pipeline/metrics.py - ターン単位のレイテンシ計測ロガー(JSONL)
+config.py         - 全設定値
+ARCHITECTURE.md   - 現在のアーキテクチャ解説(構成・スレッドモデル・レイテンシ予算)
 README.md         - セットアップ手順・使い方・チューニング指針
 ```
+
+---
+
+## 追記 (2026-08-04): ターンテイキングの方針と計測基盤の導入
+
+### 決めた方針
+会話の「快適さ」を、次の優先順位で追う:
+
+1. **速さ**(応答レイテンシ)
+2. **間の自然さ**(発話終了→AI発声のギャップ、語頭欠落、途中で切らない)
+3. **検知の精緻化**は後回し — 処理が軽くなって必要になった段階で強化する
+
+### コードから読み取った現状の仕組み(「話している / 話していない」の判定)
+- `audio/sink.py` は Silero VAD を 32ms 単位で回し、**無音が `VAD_MIN_SILENCE_MS`(300ms)続いたら
+  発話終了**とみなす「沈黙タイマー方式」。推論(STT→LLM→TTS)は**発話が終わってから初めて**走る。
+- 出力側は既に文単位ストリーム化されている(`pipeline/llm.py` が句点ごとに yield → 即 TTS)。
+- したがって体感遅延の主因は「発話終了検知の無音待ち + 発話後の直列パイプライン」。
+  次に効くのは**入力側の投機化**(発話中のストリーミング STT → 世代 ID で破棄・修正 = toy-a の
+  「動的並行」構想。barge-in の世代 ID 破棄モデルを入力側へ流用する)。
+
+### このセッションで実装したもの(方針①②の起点 = まず測れるようにする + 軽量な自然さ改善)
+1. **計測基盤**: `pipeline/metrics.py`(新規)+ `call_flow.py`。1ターン=1行の JSONL
+   (`logs/turns.jsonl`)に、**話し終わった瞬間(speech_end)を起点**とした各段レイテンシを記録。
+   - `stt_ms` / `llm_first_sentence_ms` / `tts_first_chunk_ms`
+   - `response_gap_ms`(発話終了→AI音声が実際に鳴り始めるまで = 体感/間の直接指標)
+   - `utterance_ms` / `pre_roll_ms` / `ended_at_max` / `n_sentences` / `stt_text`
+   - 無音・幻聴で応答しないターンも記録(検知チューニングの材料)
+   - `config.METRICS_ENABLED` / `METRICS_LOG_PATH` で制御
+2. **間の自然さ(pre-roll)**: `audio/sink.py`。発話確定直前の音を `VAD_PRE_ROLL_MS`(300ms)ぶん
+   リングバッファに保持し、発話先頭へ連結。VAD 検知の遅れによる**語頭欠落**(「…んにちは」)を防ぐ。
+   `on_utterance` は `VadResult`(PCM + VAD時刻メタ)を渡す形に拡張。
+3. **ギャップ計測フック**: `audio/player.py`。`begin_turn()` で発話終了時刻をセットし、応答の
+   **最初の実フレームを再生した瞬間**に経過(ms)を1回だけ通知 → `response_gap_ms` を正確に採取。
+
+### 検証(この環境でできた範囲)
+- 全変更ファイルの `py_compile` OK、`call_flow.py` の実 MLX/whisper スタック込み import OK。
+- 機能ユニットテスト 12/12 PASS(metrics の JSONL 出力 / player のギャップ1回発火 /
+  pre-roll の容量トリムと発話先頭連結)。
+- **未実施**: 実 Discord 通話での端から端の駆動(トークン・ボイスチャンネル・常駐モデルが必要で
+  この環境では不可)。実機で1通話するだけで `logs/turns.jsonl` が埋まる。
+
+### 次にやること
+1. 実機で `LOG_LATENCY=True` のまま数ターン会話 → `logs/turns.jsonl` に実測を溜める。
+2. `response_gap_ms` と各段の内訳で**どこが体感を食っているか**を確定。
+3. 実データで `VAD_MIN_SILENCE_MS`(速さ↔分断)と `VAD_PRE_ROLL_MS` を詰める。
+4. 十分軽ければ入力側の投機(ストリーミング STT → 世代 ID 破棄)へ着手。
