@@ -10,7 +10,7 @@ import numpy as np
 from discord.ext import voice_recv
 
 import config
-from audio.player import QueuedPCMSource
+from audio.player import QueuedPCMSource, _generate_ambient_pcm
 from audio.sink import UtteranceSink, VadResult
 from pipeline.llm import LanguageModel
 from pipeline.metrics import TurnLogger, TurnRecord
@@ -65,6 +65,9 @@ class CallManager:
         self.stt: SpeechToText | None = None
         self.llm: LanguageModel | None = None
         self.tts = TextToSpeech()
+        # Smart Turn(意味的終話検出)。config.SMART_TURN_ENABLED が True のときだけ
+        # load_models でロードする。None のとき sink は従来の沈黙タイマー方式のまま。
+        self.turn_detector = None
 
         self.metrics = TurnLogger(config.METRICS_LOG_PATH) if config.METRICS_ENABLED else None
         self._turn_index = 0
@@ -80,6 +83,42 @@ class CallManager:
         )
         if not tts_ready:
             print("[call] TTSエンジンが未起動のままです。着信時に再度自動起動を試みます。")
+
+        if config.SMART_TURN_ENABLED:
+            try:
+                from pipeline.turn_detector import SmartTurnDetector
+
+                detector = SmartTurnDetector(threshold=config.SMART_TURN_THRESHOLD)
+                await asyncio.to_thread(detector.warmup)  # 初回ロードを通話前に払う
+                self.turn_detector = detector
+                print("[call] Smart Turn(意味的終話検出)を有効化しました")
+            except Exception as e:  # noqa: BLE001
+                # 失敗しても通話自体は従来の沈黙方式で成立させる。
+                print(f"[call] Smart Turnのロードに失敗、沈黙方式で続行します: {e}")
+                self.turn_detector = None
+
+    def _make_player(self) -> QueuedPCMSource:
+        """再生source を作る。config.AMBIENT_ENABLED のときだけアンビエント+
+        ダッキングを有効にする。無効時は従来と同じ無音ベースの連続source。"""
+        if not config.AMBIENT_ENABLED:
+            return QueuedPCMSource()
+
+        pcm = b""
+        if config.AMBIENT_WAV_PATH:
+            try:
+                from audio.player import _wav_to_discord_pcm
+
+                with open(config.AMBIENT_WAV_PATH, "rb") as f:
+                    pcm = _wav_to_discord_pcm(f.read())
+            except Exception as e:  # noqa: BLE001
+                print(f"[call] アンビエントWAV読込失敗、自動生成に切替: {e}")
+        if not pcm:
+            pcm = _generate_ambient_pcm()
+        return QueuedPCMSource(
+            ambient_pcm=pcm,
+            idle_gain=config.AMBIENT_IDLE_GAIN,
+            duck_gain=config.AMBIENT_DUCK_GAIN,
+        )
 
     # ------------------------------------------------------------------
     # 着信
@@ -179,11 +218,16 @@ class CallManager:
             print(f"[call] ボイスチャンネルへの接続に失敗しました: {exc!r}")
             self.state = CallState.IDLE
             return
-        self.player = QueuedPCMSource()
+        self.player = self._make_player()
         self.voice_client.play(self.player)
 
         assert self.loop is not None
-        sink = UtteranceSink(config.TARGET_USER_ID, self.loop, self.handle_utterance)
+        sink = UtteranceSink(
+            config.TARGET_USER_ID,
+            self.loop,
+            self.handle_utterance,
+            turn_detector=self.turn_detector,
+        )
         self.voice_client.listen(sink)
 
         self.history = []

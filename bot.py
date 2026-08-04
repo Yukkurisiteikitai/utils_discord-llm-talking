@@ -111,6 +111,29 @@ def _patch_voice_recv_resilience() -> None:
     print("[bot] discord-ext-voice-recvの受信ループに耐障害性パッチを適用しました")
 
 
+def _dave_decrypt_or_passthrough(session, user_id, davey_mod, data, recovery):
+    """DAVE復号を試み、(Opusへ渡すバイト列, status)を返す純関数(テスト可能)。
+
+    status:
+      "decrypted"   … DAVE復号に成功
+      "passthrough" … 非暗号化(passthrough)フレーム。DAVE前のデータを素通しする
+      "skip"        … 復号失敗。破棄(b"")
+
+    Hermes Agent(MIT)の adapter.py に倣い、例外メッセージが "Unencrypted" を
+    含む場合は passthrough とみなし、NaCl復号済みの元データ(=DAVE前のOpus)を
+    そのまま返す。それ以外の例外は従来通り破棄する。
+    recovery=False のときは passthrough 復帰を行わず、あらゆる失敗を "skip" に倒す
+    (=現行の実証済み挙動を完全に維持)。
+    """
+    try:
+        out = session.decrypt(user_id, davey_mod.MediaType.audio, data)
+        return out, "decrypted"
+    except Exception as e:  # noqa: BLE001
+        if recovery and "Unencrypted" in str(e):
+            return data, "passthrough"
+        return b"", "skip"
+
+
 def _patch_voice_recv_dave_decrypt() -> None:
     """受信音声が100%の確率で `corrupted stream` になっていた根本原因への対処。
 
@@ -136,7 +159,13 @@ def _patch_voice_recv_dave_decrypt() -> None:
     # 診断/統計用のカウンタ。1パケットごとにフルトレースバックをログ出力すると
     # CPUを大きく消費し、実機で応答レイテンシが数倍〜数十倍に悪化する現象を
     # 確認したため、ログは軽量なカウンタ表示に留める。
-    _diag_state = {"logged": False, "decrypt_ok": 0, "decrypt_fail": 0}
+    _diag_state = {
+        "logged": False,
+        "decrypt_ok": 0,
+        "decrypt_fail": 0,
+        "passthrough": 0,
+    }
+    _recovery = config.DAVE_PASSTHROUGH_RECOVERY
 
     def _decode_packet_with_dave(self, packet):
         assert self._decoder is not None
@@ -150,7 +179,8 @@ def _patch_voice_recv_dave_decrypt() -> None:
                 print(
                     f"[dave patch] session={'あり' if session else 'なし'} "
                     f"ready={session.ready if session else None} "
-                    f"protocol_version={session.protocol_version if session else None}"
+                    f"protocol_version={session.protocol_version if session else None} "
+                    f"passthrough_recovery={_recovery}"
                 )
 
             if session is not None and session.ready:
@@ -158,22 +188,32 @@ def _patch_voice_recv_dave_decrypt() -> None:
                 if user_id is None:
                     user_id = self.sink.voice_client._get_id_from_ssrc(self.ssrc)
                 if user_id is not None:
-                    try:
-                        data = session.decrypt(user_id, davey.MediaType.audio, data)
-                    except Exception:
-                        # コンフォートノイズ/無音パケットなど、DAVEで暗号化
-                        # されていない特殊フレームがたまに来て失敗することがある
-                        # (UnencryptedWhenPassthroughDisabled)。復号できない
-                        # データをOpusデコーダに渡しても二重に失敗するだけ
-                        # なので、ここで諦めてこのパケットはスキップする。
+                    # Hermes(MIT)準拠の passthrough 復帰を含む純関数に委譲。
+                    # recovery=False のときは従来通り、失敗はすべて "skip"。
+                    data, status = _dave_decrypt_or_passthrough(
+                        session, user_id, davey, data, _recovery
+                    )
+                    if status == "skip":
+                        # コンフォートノイズ/無音など DAVE で暗号化されていない特殊
+                        # フレームの復号失敗。復号できないデータを Opus に渡しても
+                        # 二重に失敗するだけなので、このパケットは破棄する。
                         _diag_state["decrypt_fail"] += 1
                         if _diag_state["decrypt_fail"] % 100 == 1:
                             print(
                                 f"[dave patch] 復号失敗 累計{_diag_state['decrypt_fail']}件"
-                                f"(成功{_diag_state['decrypt_ok']}件) - スキップします"
+                                f"(成功{_diag_state['decrypt_ok']}件 / "
+                                f"passthrough{_diag_state['passthrough']}件) - スキップします"
                             )
                         return packet, b""
-                    else:
+                    if status == "passthrough":
+                        # 非暗号化フレーム。DAVE前のデータをそのまま Opus に通す。
+                        _diag_state["passthrough"] += 1
+                        if _diag_state["passthrough"] % 100 == 1:
+                            print(
+                                f"[dave patch] passthrough(非暗号化)フレームを素通し "
+                                f"累計{_diag_state['passthrough']}件"
+                            )
+                    else:  # "decrypted"
                         _diag_state["decrypt_ok"] += 1
             pcm = self._decoder.decode(data, fec=False)
             return packet, pcm

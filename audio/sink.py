@@ -74,6 +74,9 @@ class _UserState:
         self.pre_roll = np.zeros(0, dtype=np.float32)
         self.speech_start_mono = 0.0  # 発話開始を検知した time.monotonic()
         self.pre_roll_ms = 0.0        # 実際に付け足した pre-roll の長さ
+        # Smart Turn: 沈黙で「終了」と出たがまだ続くと判定した継続待ち状態。
+        # in_speech は True のまま維持し、後続フレームを同一発話へ連結する。
+        self.awaiting_continuation = False
 
 
 class UtteranceSink(voice_recv.AudioSink):
@@ -84,11 +87,14 @@ class UtteranceSink(voice_recv.AudioSink):
         target_user_id: int,
         loop: asyncio.AbstractEventLoop,
         on_utterance: OnUtterance,
+        turn_detector=None,
     ) -> None:
         super().__init__()
         self._target_user_id = target_user_id
         self._loop = loop
         self._on_utterance = on_utterance
+        # None のとき Smart Turn は完全に無効(=従来の沈黙タイマー方式のまま)。
+        self._turn_detector = turn_detector
         self._state = _UserState()
 
     def wants_opus(self) -> bool:
@@ -120,14 +126,20 @@ class UtteranceSink(voice_recv.AudioSink):
             event = state.vad_iterator(frame, return_seconds=False)
 
             if event is not None and "start" in event:
-                state.in_speech = True
-                state.speech_start_mono = time.monotonic()
-                # 確定直前までのpre-rollを発話先頭に付けて語頭欠落を防ぐ。
-                state.utterance = state.pre_roll.copy()
-                state.pre_roll_ms = (
-                    len(state.pre_roll) / config.VAD_SAMPLE_RATE * 1000
-                )
-                print("[sink] VAD: 発話開始を検知")
+                if state.awaiting_continuation:
+                    # Smart Turnで「まだ続く」と判定して継続待ちだった。溜めてある
+                    # 発話をクロバーせず、同一ターンの続きとして扱う(息継ぎ後の再開)。
+                    state.awaiting_continuation = False
+                    print("[sink] Smart Turn: 継続発話を再開(同一ターンに連結)")
+                else:
+                    state.in_speech = True
+                    state.speech_start_mono = time.monotonic()
+                    # 確定直前までのpre-rollを発話先頭に付けて語頭欠落を防ぐ。
+                    state.utterance = state.pre_roll.copy()
+                    state.pre_roll_ms = (
+                        len(state.pre_roll) / config.VAD_SAMPLE_RATE * 1000
+                    )
+                    print("[sink] VAD: 発話開始を検知")
 
             if state.in_speech:
                 state.utterance = np.concatenate([state.utterance, frame])
@@ -138,10 +150,40 @@ class UtteranceSink(voice_recv.AudioSink):
                 ]
 
             max_samples = config.VAD_MAX_UTTERANCE_MS / 1000 * config.VAD_SAMPLE_RATE
+            st_max_samples = config.SMART_TURN_MAX_MS / 1000 * config.VAD_SAMPLE_RATE
             if event is not None and "end" in event and state.in_speech:
-                self._finish_utterance(ended_at_max=False)
+                if self._should_continue(state):
+                    # 区切らずに継続。in_speech は True のまま維持して後続を連結する。
+                    state.awaiting_continuation = True
+                else:
+                    self._finish_utterance(ended_at_max=False)
             elif state.in_speech and len(state.utterance) >= max_samples:
                 self._finish_utterance(ended_at_max=True)
+            elif state.awaiting_continuation and len(state.utterance) >= st_max_samples:
+                # Smart Turnが誤って「未完了」を出し続けても、ここで強制的に区切る
+                # (継続待ちが VAD_MAX まで伸びてハングするのを防ぐ短めの安全弁)。
+                self._finish_utterance(ended_at_max=True)
+
+    def _should_continue(self, state: _UserState) -> bool:
+        """沈黙で終了判定が出た瞬間に、Smart Turnで「まだ続くか」を確認する。
+
+        Smart Turn無効(detector=None)なら常にFalse=従来通り即区切る。
+        推論失敗時も安全側に倒してFalse(沈黙方式で区切る)。
+        """
+        if self._turn_detector is None:
+            return False
+        st_max_samples = config.SMART_TURN_MAX_MS / 1000 * config.VAD_SAMPLE_RATE
+        if len(state.utterance) >= st_max_samples:
+            return False
+        try:
+            is_complete, prob = self._turn_detector.detect(state.utterance)
+        except Exception as e:  # noqa: BLE001
+            print(f"[sink] Smart Turn 推論失敗、沈黙方式で区切ります: {e}")
+            return False
+        if is_complete:
+            return False
+        print(f"[sink] Smart Turn: まだ続くと判定 (prob={prob:.2f}) -> 継続待ち")
+        return True
 
     def _finish_utterance(self, ended_at_max: bool) -> None:
         state = self._state
@@ -152,6 +194,7 @@ class UtteranceSink(voice_recv.AudioSink):
 
         state.utterance = np.zeros(0, dtype=np.float32)
         state.in_speech = False
+        state.awaiting_continuation = False
         state.pre_roll = np.zeros(0, dtype=np.float32)
         state.pre_roll_ms = 0.0
         state.vad_iterator.reset_states()

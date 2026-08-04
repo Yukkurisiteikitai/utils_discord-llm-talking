@@ -42,6 +42,13 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
+起動前に `python scripts/voice_doctor.py` を実行すると、libopus/DAVE(davey)/
+VOICEVOX/Bot権限などの前提を一括チェックできる(「繋がるのに聞こえない」系の切り分け用)。
+
+任意機能(既定OFF、`config.py` で切替): Smart Turn(意味的終話), DAVE passthrough復帰,
+アンビエント+ダッキング。Smart Turn を有効化する場合のみ ONNX モデルの配置が必要
+→ 手順は [`models/README.md`](models/README.md) を参照。
+
 ## 起動
 
 ```bash

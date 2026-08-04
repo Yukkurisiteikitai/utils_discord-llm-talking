@@ -10,3 +10,7 @@ toy-a/
 
 # 実行時に生成されるターン計測ログ。
 logs/
+
+# Smart Turn の ONNX モデル(8.7MB)。リポジトリには入れず、models/README.md の
+# 手順でローカルに配置する。README以外の models/ 配下を無視する。
+models/*.onnx
