@@ -1,0 +1,18 @@
+# Discord bot framework + リアルタイム音声受信
+discord.py[voice]>=2.4.0
+discord-ext-voice-recv @ git+https://github.com/imayhaveborkedit/discord-ext-voice-recv.git
+PyNaCl>=1.5.0
+
+# ローカルML(Apple Silicon / MLX)
+mlx>=0.20.0
+mlx-lm>=0.20.0
+mlx-whisper>=0.4.0
+
+# VAD(発話区間検出、ONNXバックエンドでtorch不要)
+silero-vad>=5.1.2
+onnxruntime>=1.18.0
+
+# 汎用
+numpy>=1.26
+aiohttp>=3.9
+python-dotenv>=1.0
