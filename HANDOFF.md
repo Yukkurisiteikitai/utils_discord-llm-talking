@@ -166,3 +166,76 @@ README.md         - セットアップ手順・使い方・チューニング指
 2. `response_gap_ms` と各段の内訳で**どこが体感を食っているか**を確定。
 3. 実データで `VAD_MIN_SILENCE_MS`(速さ↔分断)と `VAD_PRE_ROLL_MS` を詰める。
 4. 十分軽ければ入力側の投機(ストリーミング STT → 世代 ID 破棄)へ着手。
+
+---
+
+## 追記 (2026-08-05): 類似OSS調査と、そこからの4機能取り込み + WARP/SSL修正
+
+### 経緯
+類似OSSを調べ(結果は別リポジトリ `../oss_ref/COMPARISON.md`)、現行botへ「本当に必要な条件」を
+取り込んだ。**優先5本**を `../oss_ref/` に clone して比較:
+hermes-agent(MIT) / openclaw-voice(ライセンス無し) / speech-to-speech(Apache-2) /
+pipecat(BSD-2) / livekit-agents(Apache-2)。
+
+**調査の結論(ランキングの読み替え)**:
+- 現行botの最大リスク(DAVE復号 + opusパスの手パッチ)の“参照実装”は **hermes-agent の
+  `plugins/platforms/discord/adapter.py`**(voice-recv非依存の自前RTP受信でDAVE `dave_session.decrypt`まで)。MIT。
+- 「いつ喋るか(Smart Turn/発言可否)」は **openclaw-voice** が実装しているが**ライセンス不在=概念参照のみ**。
+  Smart Turnモデルの本家は **pipecat(BSD-2)** なのでモデル/実装はそこから取った。
+- 5本とも「AI発の発信(疑似着信スケジューラ)」は無し = 現行botの独自価値。
+
+### 実装した4機能(取り込み優先度 #2→#3→#1→#4)。**すべて config で切替・既定OFF=現行動作を維持**
+実機で往復動作している資産を壊さないため、リスクのある変更は opt-in にし、OFF経路は現行と同一。
+
+1. **#2 起動前診断 `scripts/voice_doctor.py`(新規)**: libopus(Homebrew既知パス)/davey=DAVE/
+   VOICEVOX応答/Bot権限を一括チェック。「繋がるのに聞こえない」系の切り分け用。
+   hermesの `discord-voice-doctor.py` を本プロジェクトの config/.env に合わせて再実装(MIT参照)。
+   実行OK(実機で davey/opus/権限Adminを検出、VOICEVOX未起動はwarn)。
+2. **#3 Smart Turn v3.2 による意味的終話検出(既定OFF)**:
+   - `pipeline/turn_detector.py`(新規) + `pipeline/_whisper_features.py`(pipecat=BSD-2 を vendor)。
+   - モデル `models/smart-turn-v3.2-cpu.onnx`(8.7MB)は **.gitignore除外**、入手手順は `models/README.md`。
+   - `audio/sink.py` に opt-in 統合: 沈黙で「終了」判定が出た瞬間に発話全体をSmart Turnへかけ、
+     未完了なら区切らず継続(`awaiting_continuation`)。誤判定でハングしないよう `SMART_TURN_MAX_MS` の安全弁。
+   - config: `SMART_TURN_ENABLED/THRESHOLD/MAX_MS/MODEL_PATH`。実ONNX推論 + sink4経路テストPASS。
+3. **#1 DAVE受信の堅牢化(既定OFF)**: `bot.py` の復号を純関数 `_dave_decrypt_or_passthrough` に抽出し、
+   hermes準拠の **passthrough(非暗号化フレーム)復帰**を追加。現行は例外時に全破棄していたが、
+   `"Unencrypted"`系の例外はDAVE前データをそのままOpusへ通す。config: `DAVE_PASSTHROUGH_RECOVERY`。全分岐テストPASS。
+4. **#4 出力の質感 ambient+ducking(既定OFF)**: 現行 `QueuedPCMSource` は既に連続sourceで
+   `is_playing()`レースは無かったため、hermes `voice_mixer` 由来の **常時アンビエント + 発話中ダッキング**
+   だけを `audio/player.py` に追加。config: `AMBIENT_ENABLED/WAV_PATH/IDLE_GAIN/DUCK_GAIN`。
+   OFFは byte-identical(ギャップ計測も維持)、ONの混合/duck/loop/clipテストPASS。
+
+commit: `8a5fed5`(4機能)。ライセンス帰属は各ファイル冒頭に保持(pipecat=BSD-2 / hermes=MIT)。
+
+### 重大な実機バグ修正: Cloudflare WARP のTLS検査でログインが落ちる
+`python3 bot.py` が `SSLCertVerificationError: self-signed certificate in certificate chain` で
+起動直後に落ちた。原因は**このMacで動く Cloudflare WARP/Zero Trust のTLS検査**で、discord.comの証明書を
+`Gateway CA - Cloudflare Managed` 発行のものに差し替えていたこと。ブラウザ/curlは macOSキーチェーンで
+このCAを信頼するので動くが、Python(uvのcpython + certifi)は certifi バンドルしか見ないため落ちる。
+→ `bot.py` 冒頭で **`truststore.inject_into_ssl()`** を呼び、SSL検証をmacOSキーチェーンに切替。
+WARPのON/OFFに関係なく繋がる。truststoreが無い環境ではcertifiにフォールバック。
+`requirements.txt` に `truststore>=0.9` 追加。注入後にaiohttpでdiscord `/users/@me` がHTTP 200を確認。
+commit: `1c7d24c`。**再発時のチェック順**: `curl https://discord.com`(=システムは200か)→ `pgrep -fi warp`
+→ Pythonだけ落ちるならこのパターン。
+
+### 実機で機能を有効化する順番(全部 config、既定は全OFF=現行動作)
+1. `.venv/bin/python scripts/voice_doctor.py` で前提確認。
+2. まず全OFFで `logs/turns.jsonl` に実測を溜める。
+3. 早切りが気になれば `SMART_TURN_ENABLED=True`(`SMART_TURN_THRESHOLD`で間の長さ調整)。
+4. 音が欠ける兆候があれば `DAVE_PASSTHROUGH_RECOVERY=True`。
+5. 通話の"間"を生かしたければ `AMBIENT_ENABLED=True`(`IDLE/DUCK_GAIN`微調整)。
+
+### 追加・変更ファイル(この追記時点)
+- 新規: `scripts/voice_doctor.py`, `pipeline/turn_detector.py`, `pipeline/_whisper_features.py`,
+  `models/README.md`, `IMPL_PROGRESS.md`(作業チェックリスト)。
+- 変更: `bot.py`(truststore注入 + DAVE純関数化), `config.py`(4機能の設定, 全既定OFF),
+  `audio/sink.py`(Smart Turn統合), `audio/player.py`(ambient+ducking), `call_flow.py`(detector/player配線),
+  `README.md`, `requirements.txt`, `.gitignore`(models/*.onnx除外)。
+- 参照専用(このリポジトリ外): `../oss_ref/`(clone 5本 + `COMPARISON.md` + `PROGRESS.md`)。
+
+### 未実施・次の候補
+- **実Discord通話での端から端の駆動は未検証**(この作業環境ではトークン/VC/常駐モデル駆動が不可)。
+  → まず実機で1通話し、各機能をONにした時の体感/ログを確認する。
+- Smart Turn の `SMART_TURN_THRESHOLD` を実データ(`logs/turns.jsonl`)で調整。
+- (大改修・任意)受信パスを hermes 方式(voice-recv非依存の自前RTP受信)へ本格移行すれば、
+  現行の内部API手パッチ依存リスクを根本的に減らせる。ブループリントは `../oss_ref/hermes-agent/.../adapter.py`。
