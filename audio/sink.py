@@ -35,6 +35,9 @@ class VadResult:
     utterance_ms: float
     pre_roll_ms: float
     ended_at_max: bool
+    # Smart Turn の判定値(OFF/未実行なら prob=None, count=0)。閾値チューニング用。
+    smart_turn_prob: float | None = None
+    continuation_count: int = 0
 
 
 OnUtterance = Callable[[VadResult], Awaitable[None]]
@@ -77,6 +80,10 @@ class _UserState:
         # Smart Turn: 沈黙で「終了」と出たがまだ続くと判定した継続待ち状態。
         # in_speech は True のまま維持し、後続フレームを同一発話へ連結する。
         self.awaiting_continuation = False
+        # Smart Turn 計装: 今の発話での「まだ続く」延長回数と、最後に得た完了確率。
+        # 発話確定ごとに VadResult へ載せてリセットする(次ターンに漏らさない)。
+        self.continuation_count = 0
+        self.last_smart_turn_prob: float | None = None
 
 
 class UtteranceSink(voice_recv.AudioSink):
@@ -180,8 +187,10 @@ class UtteranceSink(voice_recv.AudioSink):
         except Exception as e:  # noqa: BLE001
             print(f"[sink] Smart Turn 推論失敗、沈黙方式で区切ります: {e}")
             return False
+        state.last_smart_turn_prob = prob
         if is_complete:
             return False
+        state.continuation_count += 1
         print(f"[sink] Smart Turn: まだ続くと判定 (prob={prob:.2f}) -> 継続待ち")
         return True
 
@@ -190,6 +199,8 @@ class UtteranceSink(voice_recv.AudioSink):
         utterance = state.utterance
         speech_start_mono = state.speech_start_mono
         pre_roll_ms = state.pre_roll_ms
+        smart_turn_prob = state.last_smart_turn_prob
+        continuation_count = state.continuation_count
         speech_end_mono = time.monotonic()
 
         state.utterance = np.zeros(0, dtype=np.float32)
@@ -197,6 +208,8 @@ class UtteranceSink(voice_recv.AudioSink):
         state.awaiting_continuation = False
         state.pre_roll = np.zeros(0, dtype=np.float32)
         state.pre_roll_ms = 0.0
+        state.continuation_count = 0
+        state.last_smart_turn_prob = None
         state.vad_iterator.reset_states()
 
         min_samples = config.VAD_MIN_SPEECH_MS / 1000 * config.VAD_SAMPLE_RATE
@@ -213,6 +226,8 @@ class UtteranceSink(voice_recv.AudioSink):
             utterance_ms=duration_ms,
             pre_roll_ms=pre_roll_ms,
             ended_at_max=ended_at_max,
+            smart_turn_prob=smart_turn_prob,
+            continuation_count=continuation_count,
         )
         asyncio.run_coroutine_threadsafe(self._on_utterance(result), self._loop)
 

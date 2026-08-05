@@ -53,9 +53,9 @@ class LanguageModel:
             repetition_context_size=20,
         )
         print(f"[llm] loaded {model_repo} in {time.monotonic() - t0:.2f}s")
-        self._warm_up()
+        self.warm_up()
 
-    def _warm_up(self) -> None:
+    def warm_up(self) -> None:
         # mlx-lmの初回generate呼び出しはMetalカーネルのJITコンパイルが走り、
         # 数秒〜10秒近くかかることがある。ここで1回空撃ちしておくことで、
         # 通話中の最初の発話でこのコストを踏まないようにする。

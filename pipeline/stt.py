@@ -19,9 +19,11 @@ import config
 class SpeechToText:
     def __init__(self, model_repo: str = config.WHISPER_MODEL_REPO):
         self._model_repo = model_repo
-        self._warm_up()
+        self.warm_up()
 
-    def _warm_up(self) -> None:
+    def warm_up(self) -> None:
+        """無音を1回文字起こししてモデルをメモリに常駐させる。ロード時だけでなく
+        通話開始時にも呼び、アイドル中に退避した重みを温め直す用途にも使う。"""
         silence = np.zeros(config.VAD_SAMPLE_RATE, dtype=np.float32)
         t0 = time.monotonic()
         mlx_whisper.transcribe(

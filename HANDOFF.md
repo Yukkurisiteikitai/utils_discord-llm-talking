@@ -239,3 +239,58 @@ commit: `1c7d24c`。**再発時のチェック順**: `curl https://discord.com`(
 - Smart Turn の `SMART_TURN_THRESHOLD` を実データ(`logs/turns.jsonl`)で調整。
 - (大改修・任意)受信パスを hermes 方式(voice-recv非依存の自前RTP受信)へ本格移行すれば、
   現行の内部API手パッチ依存リスクを根本的に減らせる。ブループリントは `../oss_ref/hermes-agent/.../adapter.py`。
+
+---
+
+## 追記 (2026-08-05 その2): 初の実通話・計装追加・コールドスタート起因の遅延を特定/修正
+
+`NEXT_THREAD_PROMPT.md` の指示(実通話でSmartTurn閾値を実データ調整)に沿って、**初めて実Discord通話を駆動**した。
+Smart Turn の閾値チューニング自体は**未完**だが、その前提となる計装追加と、通話品質を著しく損ねていた
+コールドスタート遅延の**根本原因特定と修正**まで到達した。
+
+### 1. 計装: Smart Turn の判定値を turns.jsonl に記録(閾値チューニングの土台)
+`pipeline/metrics.py` は speech_end 起点のレイテンシしか記録しておらず、Smart Turn の確率や継続回数が
+残らず「閾値調整が勘になる」状態だった。以下2フィールドを sink→call_flow→metrics に通した:
+- `smart_turn_prob`: ターン確定時の最後の完了確率(OFF/未実行なら null)
+- `continuation_count`: 「まだ続く」で発話を延長した回数(OFFなら0)
+変更: `pipeline/metrics.py`(TurnRecord), `audio/sink.py`(`VadResult`/`_UserState`/`_should_continue`/
+`_finish_utterance` で状態退避・リセット), `call_flow.py`(TurnRecord構築で受け渡し)。
+OFF経路は音声挙動 byte-identical、JSONLに2列増えるだけ。単体スクリプトで状態遷移PASS。
+
+### 2. 実通話で判明した最大の問題: 「遅れて似た応答が来る」= コールドスタート起因
+実通話で「AIの応答が順番前後で遅れて再生される(似た内容が後から鳴る)」現象が出た。切り分けた結果:
+- **原因はコールドスタート**。ロード時warmup(既存)は効くが、**bot起動〜/call-me着信までのアイドル中に
+  8GB機ではMLXの重み/Metal状態が退避**され、初回発話のSTTが7〜14秒に膨れる(2ターン目以降は0.3〜1.4s)。
+  この初回だけ極端に遅い応答が、後続ターンの処理を追い越して**順番前後で遅れて再生**されていた。
+- **実測で確定**(scratchの実験): アイドル 30s→0.47s / 60s→1.28s / 90s→2.21s と単調悪化。
+  一方 warmup を撃った直後の transcribe は 0.26s に回復。→ 「ロード時warmupの強化」ではなく
+  **「通話開始時に温め直す」**のが正しい対処と判明(無音warmupでもデコード経路は温まる=STT warmup強化は不要)。
+- **Smart Turn は無罪**。ON時の prob は実測で全ターン 0.97〜0.99、`continuation_count`=0(=一度も延長せず、
+  +40msの推論のみ)。遅延はSmart Turnと無関係だった。
+
+### 3. 修正: 通話開始時にモデルを温め直す(挨拶TTSと並行)
+`SpeechToText._warm_up`/`LanguageModel._warm_up` を公開 `warm_up()` にリネーム。
+`call_flow.py` の `_begin_call` で、挨拶(GREETING)の合成・再生と**並行して** `_warm_up_models()` を
+`asyncio.gather` で撃つ(STT/LLM/SmartTurnを空撃ち、例外は握って通話継続)。挨拶の裏でコールドコスト
+(~3s)を吸収し、最初のユーザー発話を温かい状態で迎える。実測で warmup後の初回 transcribe は 0.26s。
+変更: `pipeline/stt.py`, `pipeline/llm.py`, `call_flow.py`。
+
+### 未実施(次スレッドの主タスク)
+- **Smart Turn 閾値(`SMART_TURN_THRESHOLD`)の実データ調整は未完**。理由: これまでの実通話では prob が
+  常に 0.97+ で `continuation_count`=0 のため、閾値0.5では早切り防止が発火していない。**息継ぎを挟んだ
+  途中終話(prob が中間値になるケース)のデータが必要**。再現には、途中で **0.5〜1秒のはっきりした間**を空ける
+  (`VAD_MIN_SILENCE_MS=300` 未満だとVADが終了判定せずSmart Turnの出番が来ない)。詳細は `NEXT_THREAD_PROMPT.md`。
+- **LLMのターンまたぎ同一応答**: 小型1.5Bがゴミ入力(早切り/幻聴STT)に対し汎用の逃げ応答
+  「わかりました。お手伝いできることが…」を返し、ターンをまたいで同一化する(繰り返しペナルティ1.3は
+  1生成内にしか効かない)。閾値チューニングとは別枠の課題。対策候補: 逃げ応答の抑制/直近応答との
+  重複チェック/SYSTEM_PROMPT調整/モデル差し替え。
+- **バージイン(割り込み)未実装**: 新発話開始時に前ターンの生成/再生キューを破棄する仕組みが無く、
+  今回はコールドスタートで露呈した。warmup修正で大半は緩和されるが、ユーザがAIに被せて話す場合に備え
+  将来的にはキャンセル機構が要る(player/call_flow 改修・大きめ)。
+
+### この追記時点の変更ファイル
+- 変更: `pipeline/metrics.py`, `audio/sink.py`, `call_flow.py`(計装 + 通話開始warmup),
+  `pipeline/stt.py`, `pipeline/llm.py`(`_warm_up`→公開`warm_up`)。
+- `config.py` の `SMART_TURN_ENABLED` は検証中に一時 True にしたが、**クリーンなONラウンド未完のため
+  既定OFF(False)に戻してコミット**(方針「既定OFF・検証後ON」を維持)。
+- `logs/turns.jsonl` は .gitignore 対象(実験データ、コミットしない)。実通話のbaseline/ON実測が入っている。

@@ -233,7 +233,27 @@ class CallManager:
         self.history = []
         self.state = CallState.IN_CALL
         print("[call] 通話開始")
-        await self._speak(GREETING, time.monotonic())
+        # 挨拶の合成・再生と並行してモデルを温め直す。8GB機ではロード〜着信までの
+        # アイドルで重みが退避され、初回発話のSTT/LLMが数秒遅くなる(実測: 90sアイドルで
+        # STT 2.2s、通話ではさらに悪化して7〜14s)。挨拶TTSの裏で空撃ちして、最初の
+        # ユーザー発話を温かい状態で迎える。
+        await asyncio.gather(
+            self._speak(GREETING, time.monotonic()),
+            asyncio.to_thread(self._warm_up_models),
+        )
+
+    def _warm_up_models(self) -> None:
+        """通話開始時にSTT/LLM/Smart Turnを空撃ちして温め直す(ブロッキング)。
+        失敗しても通話は続行する(温め直しは最適化であって必須ではない)。"""
+        try:
+            if self.stt is not None:
+                self.stt.warm_up()
+            if self.llm is not None:
+                self.llm.warm_up()
+            if self.turn_detector is not None:
+                self.turn_detector.warmup()
+        except Exception as e:  # noqa: BLE001
+            print(f"[call] 通話前ウォームアップに失敗(続行します): {e}")
 
     async def end_call(self) -> None:
         if self.voice_client is not None:
@@ -262,6 +282,8 @@ class CallManager:
                 utterance_ms=vad.utterance_ms,
                 pre_roll_ms=vad.pre_roll_ms,
                 ended_at_max=vad.ended_at_max,
+                smart_turn_prob=vad.smart_turn_prob,
+                continuation_count=vad.continuation_count,
             )
             # 発話終了→最初のAI発声のギャップは、実際の再生スレッドから受け取る。
             if self.player is not None:

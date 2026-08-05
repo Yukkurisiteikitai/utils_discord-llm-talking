@@ -40,6 +40,10 @@ class TurnRecord:
     n_sentences: int = 0            # 応答の文数
     stt_text: str = ""              # 認識結果(空 = 無音/破棄)
 
+    # --- Smart Turn(意味的終話検出)。OFF/未実行なら prob=None, count=0 ---
+    smart_turn_prob: Optional[float] = None   # ターン確定時の最後の完了確率
+    continuation_count: int = 0               # 「まだ続く」で延長した回数
+
     # 参考: 壁時計(人が読むログや他ログとの突合せ用)。
     wall_clock: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%S"))
 
