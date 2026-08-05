@@ -294,3 +294,71 @@ OFF経路は音声挙動 byte-identical、JSONLに2列増えるだけ。単体�
 - `config.py` の `SMART_TURN_ENABLED` は検証中に一時 True にしたが、**クリーンなONラウンド未完のため
   既定OFF(False)に戻してコミット**(方針「既定OFF・検証後ON」を維持)。
 - `logs/turns.jsonl` は .gitignore 対象(実験データ、コミットしない)。実通話のbaseline/ON実測が入っている。
+
+---
+
+## 追記 (2026-08-05): v2アーキテクチャ Phase 1(割り込み基盤)+ /debug + 過負荷/ループ耐性
+
+このラウンドで、上の「未実施」に挙がっていた **バージイン(割り込み)** と **ターンまたぎ同一応答** の
+両方に着手・解決し、さらに実通話のストレステストで露呈した2つの重大な安定性バグを潰した。
+
+### 0. 前提: `ARCHITECTURE_v2_PROPOSAL.md` を追加
+現行の直列 `VAD→STT→LLM→TTS` を、①ターン判定 ②投機処理 ③発声確定 ④割り込み を分離した
+イベント駆動構成へ**段階移行**する提案書(全6 Phase)。本ラウンドはその **Phase 1(Cancellation /
+Barge-in 基盤)** のみを実装。提案書自身が「投機より先に割り込み基盤を入れる」ことを最重要としている
+(§9, §15)。Phase 2以降(Smart Turn の pause-trigger 化、partial STT、投機生成 等)は未着手。
+
+### 1. Phase 1: 割り込み(barge-in)基盤 — 新規 `turn/` パッケージ
+- `turn/cancellation.py`: `CancellationToken`(協調的キャンセル)+ 単調増加の `generation_id`/`turn_id`。
+- `turn/barge_in.py`: `BargeInController`。割り込み確定時に player の epoch をバンプ+進行中生成をキャンセル。
+- `audio/player.py`: **epoch-tagged キュー化**(§4.13)。各チャンクに `playback_epoch` を付け、`read()` は
+  毎フレーム現行epochと照合し**古いチャンク(割り込みで無効化された音声)を鳴らさず破棄**。追加API:
+  `interrupt()`(epochバンプ+未再生flush+破棄ms算出), `current_epoch()`, `take_spoken_texts()`,
+  `played_chunk_count()`。playback/loop 両スレッドの整合のため `threading.Lock` で保護。
+- `audio/sink.py`: VADのstartイベントで発火する `on_speech_start` コールバックと `is_in_speech()` を追加。
+- `call_flow.py`: 各ターンに `turn_id`/`generation_id`/`gen_epoch` を付与。**確認窓**(`BARGE_IN_MIN_SPEECH_MS`
+  =180ms)でノイズを除外してから割り込み確定。会話履歴は**実際に鳴らしたチャンクのtextだけ**から構築
+  (不変条件6)。挨拶(GREETING)も割り込み対象。
+- `pipeline/llm.py`: `stream_sentences(history, cancel_token)` がトークン境界でキャンセルを見て即中断。
+- `config.py`: `BARGE_IN_ENABLED`(既定True)/`BARGE_IN_MIN_SPEECH_MS`/`FALSE_INTERRUPTION_RESUME`。
+- `pipeline/metrics.py`: `turn_id`/`generation_id`/`playback_epoch`/`interrupted`/`played_chunks`/
+  `dropped_audio_ms` を TurnRecord に追加。
+- **検証**: ユニットで「stale-epoch音声が漏れない」「spoken-only history」を確認。実通話で barge-in が
+  停止まで ~180ms で発火することをログで確認。
+
+### 2. `/debug` スラッシュコマンド + `debug_log.py`(新規)
+ターミナルを見られない状況でも、**TTSが実際に喋る中身**・STT結果・割り込み・レイテンシを Discord の
+テキストチャンネルへ流す。`/debug on`(実行チャンネルを出力先に有効化)/`off`/`here`/`status`。
+`DebugChannelLogger.emit()` はどのスレッドからでも安全(ロックしてバッファに積むだけ)、実送信は
+約1秒ごとの flush ループがまとめて(2000字分割)= レート制限回避。既定OFF。
+
+### 3. 過負荷崩壊バグ(実通話で「途中から応答しなくなる」)
+早口+ノイズ+割り込みが重なると STT/LLM レイテンシが **0.5s→30s→117s** と膨れ、応答が返らなくなった。
+- **原因**: (a) MLXの同時実行無制限(`asyncio.to_thread` が多数並走→1個のGPU/8GBを奪い合い相互に激遅化、
+  §5.2 が警告)、(b) バックプレッシャ欠如で2分前のゴミ発話まで全処理し永遠に追いつかない、
+  (c) 音楽/ノイズで Whisper が反復幻聴(`健健健…`/`Jazz Jazz…`)して単一ジョブが長時間GPUを占有。
+- **対処**(`call_flow.py`/`pipeline/stt.py`): (1) `_mlx_lock`(asyncio.Lock)で **STT+LLM+再生確定を
+  1ターンずつ直列化**=単一MLXレーン。(2) `_utterance_seq` による **latest-wins**: レーンを取れた時点で
+  より新しい発話が来ていたら古い方を破棄。(3) `looks_like_hallucination()` で反復幻聴を破棄。
+- **検証**: 統合テストで「20発話同時投入→STT実質1回・最大同時1」「間隔あき5発話→全処理」。
+
+### 4. 応答ループバグ(「話が飛んだよ」/「話が変わりますが…」の無限反復)
+ノイズ入力で履歴が汚染され、1.5Bモデルが少数フレーズを繰り返すアトラクタに固着。barge-inで途切れた
+`「...`(閉じ括弧なし)が履歴に残り、次の生成が `」` で始まり **`」`単体がTTSへ**送られた。上の Phase 1 で
+入れた「truncated応答を `…` 付きで履歴に残す」処理が反復を強化していた側面もある。
+- **対処**: (1) `pipeline/llm.py: _clean_sentence()` — カギ括弧「」を除去し、発声できない断片
+  (`」`/`?`/`…`単体)は yield しない・履歴に残さない。(2) `SYSTEM_PROMPT` に括弧・ト書き・顔文字・繰り返し
+  禁止+「聞き取れないときは短く聞き返す」を追加。(3) `call_flow.py` — 同一応答が2回連続したら会話履歴を
+  リセット(`_norm_text`/`_assistant_repeat`、`🔁`ログ/debug表示)。
+- **検証**: `_clean_sentence` の除去/保持、同一応答3回目での履歴リセットをユニットで確認。
+- **上流の根本原因**は STT がノイズで幻聴を出すこと。今回のガードは対症だが実用上は十分。将来は
+  マイク側ノイズ抑制や Whisper の `no_speech` 閾値調整が候補。
+
+### この追記時点の変更/新規ファイル
+- 新規: `ARCHITECTURE_v2_PROPOSAL.md`, `debug_log.py`, `turn/{__init__,cancellation,barge_in}.py`。
+- 変更: `audio/player.py`(epoch化), `audio/sink.py`(speech-start), `bot.py`(/debug), `call_flow.py`
+  (barge-in配線/単一MLXレーン/ループ検知/debug emit), `config.py`(barge-in/debug/SYSTEM_PROMPT),
+  `pipeline/llm.py`(cancel_token/文の衛生化), `pipeline/metrics.py`(ID・割り込み計装),
+  `pipeline/stt.py`(幻聴ガード)。
+- **未検証**: Phase 1 と各修正は「実通話でクラッシュしない」ところまで確認済みだが、barge-in の
+  `dropped_audio_ms`/`interrupted` を含む `turns.jsonl` の腰を据えた分析は未。Phase 2 以降も未着手。

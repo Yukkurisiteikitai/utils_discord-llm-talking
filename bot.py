@@ -286,6 +286,73 @@ async def hangup(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("通話を終了しました。", ephemeral=True)
 
 
+# --- /debug: 通話イベント(TTS発話内容・STT・割り込み・レイテンシ)をチャンネルへ流す ---
+debug_group = app_commands.Group(
+    name="debug",
+    description="デバッグログ(TTSの発話内容・STT結果・割り込み・レイテンシ)をチャンネルへ流す",
+)
+
+
+async def _debug_precheck(interaction: discord.Interaction) -> bool:
+    """対象ユーザーかつ準備完了かを確認する。ダメなら応答を返して False。"""
+    if not _is_target_user(interaction):
+        await interaction.response.send_message("このコマンドは使えません。", ephemeral=True)
+        return False
+    if call_manager is None:
+        await interaction.response.send_message(
+            "まだ準備中です(モデルのロードが終わってから実行してください)。",
+            ephemeral=True,
+        )
+        return False
+    return True
+
+
+@debug_group.command(name="on", description="このチャンネルにデバッグログを流し始める")
+async def debug_on(interaction: discord.Interaction) -> None:
+    if not await _debug_precheck(interaction):
+        return
+    assert call_manager is not None
+    call_manager.debug.enable(interaction.channel_id)
+    await interaction.response.send_message(
+        f"✅ デバッグログを <#{interaction.channel_id}> に流します。"
+        "(TTSの発話内容・STT結果・割り込み・レイテンシ)",
+        ephemeral=True,
+    )
+
+
+@debug_group.command(name="off", description="デバッグログの出力を止める")
+async def debug_off(interaction: discord.Interaction) -> None:
+    if not await _debug_precheck(interaction):
+        return
+    assert call_manager is not None
+    call_manager.debug.disable()
+    await interaction.response.send_message("🛑 デバッグログを停止しました。", ephemeral=True)
+
+
+@debug_group.command(name="here", description="デバッグログの出力先をこのチャンネルに変更する")
+async def debug_here(interaction: discord.Interaction) -> None:
+    if not await _debug_precheck(interaction):
+        return
+    assert call_manager is not None
+    call_manager.debug.set_channel(interaction.channel_id)
+    await interaction.response.send_message(
+        f"📍 出力先を <#{interaction.channel_id}> に変更しました。\n"
+        + call_manager.debug.status_text(),
+        ephemeral=True,
+    )
+
+
+@debug_group.command(name="status", description="デバッグログの現在の状態を表示する")
+async def debug_status(interaction: discord.Interaction) -> None:
+    if not await _debug_precheck(interaction):
+        return
+    assert call_manager is not None
+    await interaction.response.send_message(call_manager.debug.status_text(), ephemeral=True)
+
+
+tree.add_command(debug_group)
+
+
 async def _random_call_scheduler() -> None:
     assert call_manager is not None
     await client.wait_until_ready()

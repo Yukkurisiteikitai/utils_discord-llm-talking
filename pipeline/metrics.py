@@ -24,6 +24,12 @@ class TurnRecord:
 
     turn_index: int
 
+    # --- ID 体系(ARCHITECTURE_v2_PROPOSAL.md §3.3)。非同期成果物の混入防止と
+    #     barge-in/投機の因果追跡に使う。0 = 旧経路/未設定。 ---
+    turn_id: int = 0
+    generation_id: int = 0
+    playback_epoch: int = 0
+
     # --- VAD(発話区間)---
     utterance_ms: float = 0.0       # pre-roll を含む発話バッファ全体の長さ
     pre_roll_ms: float = 0.0        # 実際に先頭へ付け足した pre-roll の長さ
@@ -42,7 +48,12 @@ class TurnRecord:
 
     # --- Smart Turn(意味的終話検出)。OFF/未実行なら prob=None, count=0 ---
     smart_turn_prob: Optional[float] = None   # ターン確定時の最後の完了確率
-    continuation_count: int = 0               # 「まだ続く」で延長した回数
+    continuation_count: int = 0
+
+    # --- Barge-in(割り込み)。ARCHITECTURE_v2_PROPOSAL.md §7.3 ---
+    interrupted: bool = False        # このターンの応答がユーザー割り込みで打ち切られたか
+    played_chunks: int = 0           # 実際に再生を開始したチャンク数
+    dropped_audio_ms: float = 0.0    # 割り込みで破棄した未再生音声の長さ(ms)               # 「まだ続く」で延長した回数
 
     # 参考: 壁時計(人が読むログや他ログとの突合せ用)。
     wall_clock: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%S"))

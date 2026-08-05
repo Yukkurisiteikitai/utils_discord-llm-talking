@@ -41,6 +41,9 @@ class VadResult:
 
 
 OnUtterance = Callable[[VadResult], Awaitable[None]]
+# ユーザーの発話開始(VADのstartイベント)を、受信スレッドからイベントループへ
+# 通知するためのコールバック。barge-in(AI再生中の割り込み)の起点に使う。
+OnSpeechStart = Callable[[], Awaitable[None]]
 
 
 def _resample_to_16k_mono(pcm_bytes: bytes) -> np.ndarray:
@@ -95,6 +98,7 @@ class UtteranceSink(voice_recv.AudioSink):
         loop: asyncio.AbstractEventLoop,
         on_utterance: OnUtterance,
         turn_detector=None,
+        on_speech_start: OnSpeechStart | None = None,
     ) -> None:
         super().__init__()
         self._target_user_id = target_user_id
@@ -102,10 +106,16 @@ class UtteranceSink(voice_recv.AudioSink):
         self._on_utterance = on_utterance
         # None のとき Smart Turn は完全に無効(=従来の沈黙タイマー方式のまま)。
         self._turn_detector = turn_detector
+        # 発話開始(VAD start)をイベントループへ通知するコールバック。None なら無効。
+        self._on_speech_start = on_speech_start
         self._state = _UserState()
 
     def wants_opus(self) -> bool:
         return False
+
+    def is_in_speech(self) -> bool:
+        """現在ユーザーが発話中か(barge-in の確認窓で「まだ喋っているか」を見る)。"""
+        return self._state.in_speech
 
     def write(self, user, data: voice_recv.VoiceData) -> None:
         if user is None or user.id != self._target_user_id:
@@ -133,6 +143,12 @@ class UtteranceSink(voice_recv.AudioSink):
             event = state.vad_iterator(frame, return_seconds=False)
 
             if event is not None and "start" in event:
+                # AI再生中ならこれが割り込みの起点になり得る。受信スレッドをブロック
+                # しないよう、判定はイベントループ側(barge-in ハンドラ)へ委ねる。
+                if self._on_speech_start is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        self._on_speech_start(), self._loop
+                    )
                 if state.awaiting_continuation:
                     # Smart Turnで「まだ続く」と判定して継続待ちだった。溜めてある
                     # 発話をクロバーせず、同一ターンの続きとして扱う(息継ぎ後の再開)。
