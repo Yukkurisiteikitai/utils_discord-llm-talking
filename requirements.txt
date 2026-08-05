@@ -16,3 +16,6 @@ onnxruntime>=1.18.0
 numpy>=1.26
 aiohttp>=3.9
 python-dotenv>=1.0
+# TLS検査プロキシ(Cloudflare WARP/Zero Trust等)環境で、SSL検証にOSの信頼ストアを
+# 使いdiscord.comへの接続失敗(self-signed certificate in certificate chain)を防ぐ。
+truststore>=0.9

@@ -11,6 +11,20 @@ import logging
 import os
 import random
 
+# discord.py(aiohttp)は既定で certifi のCAバンドルを使うため、Cloudflare WARP /
+# Zero Trust などTLS検査プロキシが入った環境では、差し込まれた社内/Gateway CAを
+# 知らず discord.com への接続が SSLCertVerificationError("self-signed certificate
+# in certificate chain")で落ちる。truststore を注入すると Python の SSL 検証が
+# macOSキーチェーン(WARPのGateway CAを含む)を使うようになり、WARPのON/OFFに
+# 関係なく繋がる。truststore が無い環境では従来通り certifi にフォールバックする。
+try:
+    import truststore
+
+    truststore.inject_into_ssl()
+    print("[bot] truststore を注入しました(SSL検証にmacOSキーチェーンを使用)")
+except Exception as _e:  # noqa: BLE001
+    print(f"[bot] truststore を注入できませんでした({_e}) — certifiで続行します")
+
 import discord
 from discord import app_commands
 
